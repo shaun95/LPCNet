@@ -1,8 +1,33 @@
 #!/usr/bin/python3
+'''Copyright (c) 2018 Mozilla
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+   - Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+   - Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR
+   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'''
 
 import math
 from keras.models import Model
-from keras.layers import Input, LSTM, CuDNNGRU, Dense, Embedding, Reshape, Concatenate, Lambda, Conv1D, Multiply, Add, Bidirectional, MaxPooling1D, Activation
+from keras.layers import Input, GRU, CuDNNGRU, Dense, Embedding, Reshape, Concatenate, Lambda, Conv1D, Multiply, Add, Bidirectional, MaxPooling1D, Activation
 from keras import backend as K
 from keras.initializers import Initializer
 from keras.callbacks import Callback
@@ -32,21 +57,22 @@ class Sparsify(Callback):
             pass
         else:
             #print("constrain");
-            layer = self.model.get_layer('cu_dnngru_1')
+            layer = self.model.get_layer('gru_a')
             w = layer.get_weights()
             p = w[1]
             nb = p.shape[1]//p.shape[0]
             N = p.shape[0]
             #print("nb = ", nb, ", N = ", N);
             #print(p.shape)
-            density = self.final_density
-            if self.batch < self.t_end:
-                r = 1 - (self.batch-self.t_start)/(self.t_end - self.t_start)
-                density = 1 - (1-self.final_density)*(1 - r*r*r)
             #print ("density = ", density)
             for k in range(nb):
+                density = self.final_density[k]
+                if self.batch < self.t_end:
+                    r = 1 - (self.batch-self.t_start)/(self.t_end - self.t_start)
+                    density = 1 - (1-self.final_density[k])*(1 - r*r*r)
                 A = p[:, k*N:(k+1)*N]
                 A = A - np.diag(np.diag(A))
+                A = np.transpose(A, (1, 0))
                 L=np.reshape(A, (N, N//16, 16))
                 S=np.sum(L*L, axis=-1)
                 SS=np.sort(np.reshape(S, (-1,)))
@@ -54,6 +80,7 @@ class Sparsify(Callback):
                 mask = (S>=thresh).astype('float32');
                 mask = np.repeat(mask, 16, axis=1)
                 mask = np.minimum(1, mask + np.diag(np.ones((N,))))
+                mask = np.transpose(mask, (1, 0))
                 p[:, k*N:(k+1)*N] = p[:, k*N:(k+1)*N]*mask
                 #print(thresh, np.mean(mask))
             w[1] = p
@@ -85,7 +112,7 @@ class PCMInit(Initializer):
             'seed': self.seed
         }
 
-def new_lpcnet_model(rnn_units1=384, rnn_units2=16, nb_used_features = 38):
+def new_lpcnet_model(rnn_units1=384, rnn_units2=16, nb_used_features = 38, use_gpu=True):
     pcm = Input(shape=(None, 2))
     exc = Input(shape=(None, 1))
     feat = Input(shape=(None, nb_used_features))
@@ -94,31 +121,36 @@ def new_lpcnet_model(rnn_units1=384, rnn_units2=16, nb_used_features = 38):
     dec_state1 = Input(shape=(rnn_units1,))
     dec_state2 = Input(shape=(rnn_units2,))
 
-    fconv1 = Conv1D(128, 3, padding='same', activation='tanh')
-    fconv2 = Conv1D(102, 3, padding='same', activation='tanh')
+    fconv1 = Conv1D(128, 3, padding='same', activation='tanh', name='feature_conv1')
+    fconv2 = Conv1D(102, 3, padding='same', activation='tanh', name='feature_conv2')
 
-    embed = Embedding(256, embed_size, embeddings_initializer=PCMInit())
+    embed = Embedding(256, embed_size, embeddings_initializer=PCMInit(), name='embed_sig')
     cpcm = Reshape((-1, embed_size*2))(embed(pcm))
-    embed2 = Embedding(256, embed_size, embeddings_initializer=PCMInit())
+    embed2 = Embedding(256, embed_size, embeddings_initializer=PCMInit(), name='embed_exc')
     cexc = Reshape((-1, embed_size))(embed2(exc))
 
-    pembed = Embedding(256, 64)
+    pembed = Embedding(256, 64, name='embed_pitch')
     cat_feat = Concatenate()([feat, Reshape((-1, 64))(pembed(pitch))])
     
     cfeat = fconv2(fconv1(cat_feat))
 
-    fdense1 = Dense(128, activation='tanh')
-    fdense2 = Dense(128, activation='tanh')
+    fdense1 = Dense(128, activation='tanh', name='feature_dense1')
+    fdense2 = Dense(128, activation='tanh', name='feature_dense2')
 
     cfeat = Add()([cfeat, cat_feat])
     cfeat = fdense2(fdense1(cfeat))
     
     rep = Lambda(lambda x: K.repeat_elements(x, 160, 1))
 
-    rnn = CuDNNGRU(rnn_units1, return_sequences=True, return_state=True)
-    rnn2 = CuDNNGRU(rnn_units2, return_sequences=True, return_state=True)
+    if use_gpu:
+        rnn = CuDNNGRU(rnn_units1, return_sequences=True, return_state=True, name='gru_a')
+        rnn2 = CuDNNGRU(rnn_units2, return_sequences=True, return_state=True, name='gru_b')
+    else:
+        rnn = GRU(rnn_units1, return_sequences=True, return_state=True, recurrent_activation="sigmoid", reset_after='true', name='gru_a')
+        rnn2 = GRU(rnn_units2, return_sequences=True, return_state=True, recurrent_activation="sigmoid", reset_after='true', name='gru_b')
+
     rnn_in = Concatenate()([cpcm, cexc, rep(cfeat)])
-    md = MDense(pcm_levels, activation='softmax')
+    md = MDense(pcm_levels, activation='softmax', name='dual_fc')
     gru_out1, _ = rnn(rnn_in)
     gru_out2, _ = rnn2(Concatenate()([gru_out1, rep(cfeat)]))
     ulaw_prob = md(gru_out2)
